@@ -91,43 +91,82 @@ def import_device_log(project_dir, file_path):
     return len(df)
 
 
-def import_photos(project_dir, photo_dir):
+def import_photos(project_dir, photo_dir, mapping_file=None):
     config = load_config(project_dir)
     if not os.path.isdir(photo_dir):
         raise NotADirectoryError(f"照片目录不存在: {photo_dir}")
 
     photo_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".heic"}
     target_dir = os.path.join(project_dir, PHOTOS_DIR)
-    count = 0
-    mapping = []
 
-    for root, _dirs, files in os.walk(photo_dir):
-        for fname in files:
-            ext = os.path.splitext(fname)[1].lower()
+    explicit_map = None
+    if mapping_file:
+        if not os.path.exists(mapping_file):
+            raise FileNotFoundError(f"照片映射表不存在: {mapping_file}")
+        explicit_map = pd.read_csv(mapping_file, dtype=str)
+        required_cols = {"photo_file", "record_id"}
+        if not required_cols.issubset(set(explicit_map.columns)):
+            raise ValueError(f"映射表需包含 'photo_file' 和 'record_id' 两列，当前列: {list(explicit_map.columns)}")
+
+    mapping = []
+    count = 0
+
+    if explicit_map is not None:
+        for _, row in explicit_map.iterrows():
+            photo_file = str(row["photo_file"]).strip()
+            record_id = str(row["record_id"]).strip()
+            src = os.path.join(photo_dir, photo_file)
+            if not os.path.exists(src):
+                for root, _dirs, files in os.walk(photo_dir):
+                    for f in files:
+                        if f == photo_file or f == os.path.basename(photo_file):
+                            src = os.path.join(root, f)
+                            break
+                    else:
+                        continue
+                    break
+
+            ext = os.path.splitext(photo_file)[1].lower()
             if ext not in photo_extensions:
                 continue
-            src = os.path.join(root, fname)
-            rel_path = os.path.relpath(src, photo_dir)
-            record_id = os.path.splitext(rel_path.replace(os.sep, "_"))[0]
+
+            rel_path = photo_file
             dest = os.path.join(target_dir, rel_path)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
-            shutil.copy2(src, dest)
-            mapping.append({"record_id": record_id, "photo_path": rel_path})
-            count += 1
+            if os.path.exists(src):
+                shutil.copy2(src, dest)
+                mapping.append({"record_id": record_id, "photo_path": rel_path})
+                count += 1
+    else:
+        for root, _dirs, files in os.walk(photo_dir):
+            for fname in files:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in photo_extensions:
+                    continue
+                src = os.path.join(root, fname)
+                rel_path = os.path.relpath(src, photo_dir)
+                record_id = os.path.splitext(rel_path.replace(os.sep, "_"))[0]
+                dest = os.path.join(target_dir, rel_path)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copy2(src, dest)
+                mapping.append({"record_id": record_id, "photo_path": rel_path})
+                count += 1
 
-    mapping_file = os.path.join(project_dir, DATA_DIR, "photo_mapping.csv")
-    if os.path.exists(mapping_file):
-        existing_map = pd.read_csv(mapping_file, dtype=str)
-        new_map = pd.DataFrame(mapping)
+    mapping_data_file = os.path.join(project_dir, DATA_DIR, "photo_mapping.csv")
+    new_map = pd.DataFrame(mapping) if mapping else pd.DataFrame(columns=["record_id", "photo_path"])
+
+    if os.path.exists(mapping_data_file):
+        existing_map = pd.read_csv(mapping_data_file, dtype=str)
         combined_map = pd.concat([existing_map, new_map], ignore_index=True)
     else:
-        combined_map = pd.DataFrame(mapping) if mapping else pd.DataFrame(columns=["record_id", "photo_path"])
+        combined_map = new_map
 
     if not combined_map.empty:
-        combined_map.to_csv(mapping_file, index=False, encoding="utf-8-sig")
+        combined_map.to_csv(mapping_data_file, index=False, encoding="utf-8-sig")
 
     config["stats"]["total_photos"] = len(combined_map)
     save_config(project_dir, config)
 
-    log_operation(project_dir, "import_photos", f"导入照片目录 {photo_dir}，{count} 张照片")
+    mode_desc = "映射表" if mapping_file else "文件名推断"
+    log_operation(project_dir, "import_photos", f"导入照片目录 {photo_dir}，{count} 张照片（{mode_desc}）")
     return count

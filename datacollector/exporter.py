@@ -1,7 +1,6 @@
 import os
-import json
 import pandas as pd
-from .project import load_config, DATA_DIR, PHOTOS_DIR, EXPORT_DIR
+from .project import load_config, DATA_DIR, EXPORT_DIR
 from .logger import log_operation
 
 
@@ -40,6 +39,39 @@ def _link_photos(df, project_dir, photo_id_field):
     return df
 
 
+def _attach_review(df, project_dir, data_type):
+    review_file = os.path.join(project_dir, DATA_DIR, f"review_{data_type}.csv")
+    if not os.path.exists(review_file):
+        df["_review_status"] = ""
+        df["_review_conclusion"] = ""
+        return df
+
+    review_df = pd.read_csv(review_file, dtype=str)
+    dup_keys_conf = load_config(project_dir).get("duplicate_key_fields", ["id"])
+    key_field = dup_keys_conf[0] if dup_keys_conf else "id"
+
+    if key_field not in df.columns or key_field not in review_df.columns:
+        df["_review_status"] = ""
+        df["_review_conclusion"] = ""
+        return df
+
+    review_subset = review_df[[key_field, "_review_status", "_review_conclusion"]] \
+        if "_review_conclusion" in review_df.columns else \
+        review_df[[key_field, "_review_status"]]
+    review_subset = review_subset.rename(columns={
+        "_review_status": "_review_status",
+        "_review_conclusion": "_review_conclusion",
+    })
+
+    df = df.merge(review_subset, on=key_field, how="left")
+    df["_review_status"] = df["_review_status"].fillna("")
+    if "_review_conclusion" in df.columns:
+        df["_review_conclusion"] = df["_review_conclusion"].fillna("")
+    else:
+        df["_review_conclusion"] = ""
+    return df
+
+
 def export_data(
     project_dir,
     data_type="questionnaires",
@@ -49,6 +81,7 @@ def export_data(
     split_by_region=False,
     region_field=None,
     output_dir=None,
+    with_review=False,
 ):
     config = load_config(project_dir)
     df = _load_data(project_dir, data_type)
@@ -60,6 +93,9 @@ def export_data(
     if link_photos:
         photo_id = config.get("photo_id_field", "id")
         df = _link_photos(df, project_dir, photo_id)
+
+    if with_review:
+        df = _attach_review(df, project_dir, data_type)
 
     out_dir = output_dir or os.path.join(project_dir, EXPORT_DIR)
     os.makedirs(out_dir, exist_ok=True)

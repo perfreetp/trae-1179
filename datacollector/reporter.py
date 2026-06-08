@@ -3,6 +3,7 @@ from datetime import datetime
 import pandas as pd
 from .project import load_config, DATA_DIR, ERRORS_DIR, REPORT_DIR, PHOTOS_DIR
 from .logger import read_logs
+from .reviewer import get_review_summary
 
 
 def _load_data_safe(project_dir, data_type):
@@ -55,6 +56,12 @@ def get_progress(project_dir, start_date=None, end_date=None):
                 error_count += len(err_df)
     stats["error_count"] = error_count
 
+    review_summary = get_review_summary(project_dir)
+    stats["review_pending"] = review_summary["pending"]
+    stats["review_passed"] = review_summary["passed"]
+    stats["review_issues"] = review_summary["issues"]
+    stats["review_total"] = review_summary["total"]
+
     return stats
 
 
@@ -90,6 +97,17 @@ def generate_report(project_dir, start_date=None, end_date=None, output_file=Non
     lines.append(f"已校验: {'是' if progress.get('checked') else '否'}")
     lines.append(f"校验错误数: {progress.get('error_count', 0)}")
     lines.append("")
+
+    review_total = progress.get("review_total", 0)
+    if review_total > 0:
+        lines.append("-" * 40)
+        lines.append("复核统计")
+        lines.append("-" * 40)
+        lines.append(f"待复核: {progress.get('review_pending', 0)} 条")
+        lines.append(f"已通过: {progress.get('review_passed', 0)} 条")
+        lines.append(f"有问题: {progress.get('review_issues', 0)} 条")
+        lines.append(f"复核总计: {review_total} 条")
+        lines.append("")
 
     region_counts = progress.get("region_counts", {})
     if region_counts:

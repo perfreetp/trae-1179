@@ -1,7 +1,7 @@
 import click
 import os
 
-from .project import init_project, load_config
+from .project import init_project, load_config, view_config, set_config
 from .importer import import_questionnaire, import_device_log, import_photos
 from .checker import check_project, get_duplicate_records
 from .tagger import tag_records, remove_tag
@@ -9,6 +9,15 @@ from .merger import merge_projects
 from .sampler import extract_sample
 from .exporter import export_data
 from .reporter import get_progress, generate_report
+from .reviewer import (
+    init_review,
+    update_review,
+    get_review_summary,
+    generate_review_list,
+    REVIEW_STATUS_PENDING,
+    REVIEW_STATUS_PASSED,
+    REVIEW_STATUS_ISSUES,
+)
 
 
 @click.group()
@@ -37,7 +46,8 @@ def init(project_dir, name):
 @click.option("--type", "data_type", type=click.Choice(["questionnaire", "device_log", "photos"]), required=True, help="导入类型")
 @click.option("--file", "file_path", type=click.Path(exists=True), default=None, help="文件路径（问卷/日志）")
 @click.option("--dir", "photo_dir", type=click.Path(exists=True), default=None, help="照片目录路径")
-def import_data(project_dir, data_type, file_path, photo_dir):
+@click.option("--mapping", "mapping_file", type=click.Path(exists=True), default=None, help="照片映射表 CSV（含 photo_file, record_id 列）")
+def import_data(project_dir, data_type, file_path, photo_dir, mapping_file):
     """导入问卷、设备日志或现场照片"""
     try:
         if data_type == "questionnaire":
@@ -56,8 +66,9 @@ def import_data(project_dir, data_type, file_path, photo_dir):
             if not photo_dir:
                 click.echo("✗ 照片导入需要指定 --dir 参数", err=True)
                 return
-            count = import_photos(project_dir, photo_dir)
-            click.echo(f"✓ 导入照片完成: {count} 张")
+            count = import_photos(project_dir, photo_dir, mapping_file)
+            mode = "（映射表模式）" if mapping_file else "（文件名推断模式）"
+            click.echo(f"✓ 导入照片完成: {count} 张 {mode}")
     except Exception as e:
         click.echo(f"✗ 导入失败: {e}", err=True)
 
@@ -92,7 +103,6 @@ def check(project_dir, data_type, show_duplicates):
             if dups:
                 click.echo(f"  重复记录: {len(dups)} 条")
 
-            config = load_config(project_dir)
             error_file = os.path.join(project_dir, "errors", f"check_errors_{data_type}.csv")
             click.echo(f"  错误清单已保存: {error_file}")
 
@@ -148,8 +158,13 @@ def merge(target_project_dir, source_dirs, data_type):
 def sample(project_dir, size, method, data_type, seed):
     """抽取复核样本"""
     try:
-        sample_df, sample_ids = extract_sample(project_dir, size, method, data_type, seed)
+        sample_df, sample_ids, shortfall = extract_sample(project_dir, size, method, data_type, seed)
+
+        init_review(project_dir, sample_ids, data_type)
+
         click.echo(f"✓ 抽样完成: {len(sample_df)} 条，方法: {method}")
+        if shortfall > 0:
+            click.echo(f"  ⚠ 记录总数不足，请求 {size} 条，实际只能抽到 {len(sample_df)} 条（差 {shortfall} 条）")
         if len(sample_ids) <= 20:
             click.echo(f"  样本ID: {', '.join(str(i) for i in sample_ids)}")
     except Exception as e:
@@ -165,7 +180,8 @@ def sample(project_dir, size, method, data_type, seed):
 @click.option("--split-by-region", is_flag=True, default=False, help="按地区拆分数据")
 @click.option("--region-field", default=None, help="地区字段名")
 @click.option("--output", "output_dir", default=None, help="输出目录")
-def export(project_dir, fmt, data_type, no_hide_sensitive, no_link_photos, split_by_region, region_field, output_dir):
+@click.option("--with-review", is_flag=True, default=False, help="导出时带上复核状态和结论")
+def export(project_dir, fmt, data_type, no_hide_sensitive, no_link_photos, split_by_region, region_field, output_dir, with_review):
     """导出数据为通用格式"""
     try:
         out = export_data(
@@ -177,6 +193,7 @@ def export(project_dir, fmt, data_type, no_hide_sensitive, no_link_photos, split
             split_by_region=split_by_region,
             region_field=region_field,
             output_dir=output_dir,
+            with_review=with_review,
         )
         click.echo(f"✓ 导出完成，输出目录: {os.path.abspath(out)}")
     except Exception as e:
@@ -202,6 +219,13 @@ def report(project_dir, start_date, end_date, output_file, progress_only):
             click.echo(f"  已校验: {'是' if progress.get('checked') else '否'}")
             click.echo(f"  校验错误数: {progress.get('error_count', 0)}")
 
+            review_total = progress.get("review_total", 0)
+            if review_total > 0:
+                click.echo(f"  复核统计:")
+                click.echo(f"    待复核: {progress.get('review_pending', 0)} 条")
+                click.echo(f"    已通过: {progress.get('review_passed', 0)} 条")
+                click.echo(f"    有问题: {progress.get('review_issues', 0)} 条")
+
             region_counts = progress.get("region_counts", {})
             if region_counts:
                 click.echo("  分地区统计:")
@@ -214,6 +238,82 @@ def report(project_dir, start_date, end_date, output_file, progress_only):
             click.echo(text)
     except Exception as e:
         click.echo(f"✗ 报告生成失败: {e}", err=True)
+
+
+@cli.group()
+def config():
+    """查看或修改项目配置"""
+    pass
+
+
+@config.command("view")
+@click.argument("project_dir", type=click.Path(exists=True))
+def config_view(project_dir):
+    """查看当前项目配置"""
+    try:
+        cfg = view_config(project_dir)
+        click.echo("项目配置:")
+        for key, value in cfg.items():
+            if isinstance(value, list):
+                click.echo(f"  {key}: {', '.join(str(v) for v in value)}")
+            else:
+                click.echo(f"  {key}: {value}")
+    except Exception as e:
+        click.echo(f"✗ 查看配置失败: {e}", err=True)
+
+
+@config.command("set")
+@click.argument("project_dir", type=click.Path(exists=True))
+@click.argument("key")
+@click.argument("value")
+def config_set(project_dir, key, value):
+    """修改项目配置项（列表类型用逗号分隔）"""
+    try:
+        parsed = set_config(project_dir, key, value)
+        if isinstance(parsed, list):
+            click.echo(f"✓ 配置 '{key}' 已更新为: {', '.join(str(v) for v in parsed)}")
+        else:
+            click.echo(f"✓ 配置 '{key}' 已更新为: {parsed}")
+    except Exception as e:
+        click.echo(f"✗ 配置修改失败: {e}", err=True)
+
+
+@cli.command("review")
+@click.argument("project_dir", type=click.Path(exists=True))
+@click.option("--id", "record_id", required=True, help="记录ID")
+@click.option("--status", required=True, type=click.Choice(["待复核", "已通过", "有问题"]), help="复核状态")
+@click.option("--conclusion", default="", help="复核结论")
+@click.option("--type", "data_type", default="questionnaires", help="数据类型")
+def review(project_dir, record_id, status, conclusion, data_type):
+    """标记复核状态、录入复核结论"""
+    try:
+        update_review(project_dir, record_id, status, conclusion, data_type)
+        click.echo(f"✓ 记录 {record_id} 复核状态: {status}")
+        if conclusion:
+            click.echo(f"  结论: {conclusion}")
+    except Exception as e:
+        click.echo(f"✗ 复核操作失败: {e}", err=True)
+
+
+@cli.command("review-summary")
+@click.argument("project_dir", type=click.Path(exists=True))
+@click.option("--type", "data_type", default="questionnaires", help="数据类型")
+@click.option("--generate-list", is_flag=True, default=False, help="同时生成复核清单文件")
+def review_summary(project_dir, data_type, generate_list):
+    """查看复核摘要或生成复核清单"""
+    try:
+        summary = get_review_summary(project_dir, data_type)
+        click.echo("复核统计:")
+        click.echo(f"  待复核: {summary['pending']} 条")
+        click.echo(f"  已通过: {summary['passed']} 条")
+        click.echo(f"  有问题: {summary['issues']} 条")
+        click.echo(f"  复核总计: {summary['total']} 条")
+
+        if generate_list:
+            path = generate_review_list(project_dir, data_type)
+            click.echo(f"✓ 复核清单已生成: {os.path.abspath(path)}")
+    except Exception as e:
+        click.echo(f"✗ 复核摘要失败: {e}", err=True)
 
 
 if __name__ == "__main__":

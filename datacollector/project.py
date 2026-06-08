@@ -13,6 +13,15 @@ EXPORT_DIR = "export"
 REPORT_DIR = "report"
 ERRORS_DIR = "errors"
 
+CONFIGURABLE_KEYS = {
+    "required_fields": list,
+    "duplicate_key_fields": list,
+    "region_field": str,
+    "date_field": str,
+    "sensitive_fields": list,
+    "photo_id_field": str,
+}
+
 
 def _default_config(name):
     return {
@@ -64,6 +73,9 @@ def init_project(project_dir, name=None):
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
+    from .logger import log_operation
+    log_operation(project_dir, "init", f"创建项目 '{name}'")
+
     return config
 
 
@@ -79,3 +91,33 @@ def save_config(project_dir, config):
     config_path = os.path.join(project_dir, PROJECT_CONFIG_FILE)
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
+
+
+def view_config(project_dir):
+    config = load_config(project_dir)
+    result = {}
+    for key in CONFIGURABLE_KEYS:
+        result[key] = config.get(key)
+    return result
+
+
+def set_config(project_dir, key, value):
+    if key not in CONFIGURABLE_KEYS:
+        raise KeyError(f"不可配置项: '{key}'，可配置项: {', '.join(CONFIGURABLE_KEYS.keys())}")
+
+    config = load_config(project_dir)
+    expected_type = CONFIGURABLE_KEYS[key]
+
+    if expected_type == list:
+        parsed = [v.strip() for v in value.split(",") if v.strip()]
+    else:
+        parsed = value
+
+    old_value = config.get(key)
+    config[key] = parsed
+    save_config(project_dir, config)
+
+    from .logger import log_operation
+    log_operation(project_dir, "config_set", f"配置 '{key}': {old_value} -> {parsed}")
+
+    return parsed
